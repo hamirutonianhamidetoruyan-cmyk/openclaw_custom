@@ -1,0 +1,14 @@
+services:
+  openclaw_custom:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: openclaw_custom
+    env_file:
+      - .env.openclaw
+    volumes:
+      - ./app:/app
+      - ./workspace:/workspace
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
