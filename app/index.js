@@ -40,7 +40,9 @@ const SAFE_TOOL_NAMES = new Set([
   "list_files",
   "read_file",
   "write_file",
-  "edit_file"
+  "edit_file",
+  "web_search",
+  "fetch_url"
 ]);
 
 const HIGH_RISK_KEYWORDS = [
@@ -456,18 +458,34 @@ function getMessageText(message) {
   const content = message.content;
 
   if (typeof content === "string") {
-    return content;
+    return content.trim();
   }
 
   if (Array.isArray(content)) {
-    return content
+    const joined = content
       .map(part => {
         if (typeof part === "string") return part;
         if (part?.type === "text") return part.text || "";
+        if (part?.type === "output_text") return part.text || "";
+        if (typeof part?.content === "string") return part.content;
         return "";
       })
       .join("\n")
       .trim();
+
+    if (joined) return joined;
+  }
+
+  if (typeof message?.text === "string" && message.text.trim()) {
+    return message.text.trim();
+  }
+
+  if (typeof message?.output_text === "string" && message.output_text.trim()) {
+    return message.output_text.trim();
+  }
+
+  if (typeof message?.refusal === "string" && message.refusal.trim()) {
+    return message.refusal.trim();
   }
 
   return "";
@@ -492,6 +510,66 @@ function extractJsonObject(text) {
 
   return null;
 }
+function messagesToResponsesInput(messages = []) {
+  return messages.map(msg => {
+    if (msg.role === "system") {
+      return {
+        role: "system",
+        content: [{ type: "input_text", text: String(msg.content || "") }]
+      };
+    }
+
+    if (msg.role === "user") {
+      return {
+        role: "user",
+        content: [{ type: "input_text", text: String(msg.content || "") }]
+      };
+    }
+
+    if (msg.role === "assistant") {
+      return {
+        role: "assistant",
+        content: [{ type: "output_text", text: String(msg.content || "") }]
+      };
+    }
+
+    if (msg.role === "tool") {
+      return {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: `Tool result:\n${String(msg.content || "")}`
+          }
+        ]
+      };
+    }
+
+    return {
+      role: "user",
+      content: [{ type: "input_text", text: String(msg.content || "") }]
+    };
+  });
+}
+
+function getResponsesOutputText(response) {
+  if (!response) return "";
+
+  if (typeof response.output_text === "string" && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
+
+  const parts = [];
+  for (const item of response.output || []) {
+    for (const c of item.content || []) {
+      if (c.type === "output_text" && c.text) {
+        parts.push(c.text);
+      }
+    }
+  }
+
+  return parts.join("\n").trim();
+}
 
 async function callLLM(taskType, { messages, tools, temperature = 0.2, max_tokens = 1200 } = {}) {
   const route = getEffectiveRoute(taskType);
@@ -504,6 +582,27 @@ async function callLLM(taskType, { messages, tools, temperature = 0.2, max_token
     max_completion_tokens: max_tokens
   };
 
+  const joined = (messages || [])
+    .map(m => String(m?.content || ""))
+    .join("\n")
+    .toLowerCase();
+
+  const needsSearch =
+    route.provider === "qwen" &&
+    process.env.QWEN_ENABLE_WEB_SEARCH === "true" &&
+    (taskType === "chat" || taskType === "plan") &&
+    [
+      "最新", "news", "料金", "価格", "release", "リリース",
+      "api", "version", "モデル", "公開", "today", "2026", "現在"
+    ].some(k => joined.includes(k));
+
+  if (needsSearch) {
+    payload.enable_search = true;
+    payload.search_options = {
+      search_strategy: "agent"
+    };
+  }
+
   if (tools?.length) {
     payload.tools = tools;
     payload.tool_choice = "auto";
@@ -511,6 +610,9 @@ async function callLLM(taskType, { messages, tools, temperature = 0.2, max_token
 
   const response = await sdk.chat.completions.create(payload);
   await appendUsageFromChatResponse(response, route.provider, route.model);
+
+  console.log("callLLM payload:", JSON.stringify(payload, null, 2));
+  console.log("callLLM response:", JSON.stringify(response, null, 2));
 
   return {
     route,
@@ -536,6 +638,79 @@ async function readFile(relativePath) {
   return await fs.readFile(target, "utf8");
 }
 
+function normalizeGitHubUrl(inputUrl) {
+  const url = String(inputUrl || "").trim();
+
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error("http または https のURLを指定してください");
+  }
+
+  const u = new URL(url);
+
+  if (
+    u.hostname === "github.com" &&
+    u.pathname.includes("/blob/")
+  ) {
+    const parts = u.pathname.split("/").filter(Boolean);
+    // owner/repo/blob/branch/path/to/file
+    if (parts.length >= 5 && parts[2] === "blob") {
+      const owner = parts[0];
+      const repo = parts[1];
+      const branch = parts[3];
+      const filePath = parts.slice(4).join("/");
+      return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`;
+    }
+  }
+
+  return url;
+}
+
+function stripHtml(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchUrl(url) {
+  const normalizedUrl = normalizeGitHubUrl(url);
+
+  const res = await fetch(normalizedUrl, {
+    headers: {
+      "User-Agent": "discord-agent",
+      "Accept": "text/plain, text/html;q=0.9, */*;q=0.8"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`fetch failed: ${res.status} ${res.statusText}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  const body = await res.text();
+
+  let text = body;
+  if (contentType.includes("text/html")) {
+    text = stripHtml(body);
+  }
+
+  if (!text.trim()) {
+    throw new Error("URLの本文を取得できませんでした");
+  }
+
+  return {
+    url: normalizedUrl,
+    content_type: contentType,
+    content: text.slice(0, 200000)
+  };
+}
+
 async function writeFile(relativePath, content) {
   const target = safeJoin(relativePath);
   await fs.mkdir(path.dirname(target), { recursive: true });
@@ -552,6 +727,53 @@ async function editFile(relativePath, findText, replaceText) {
   const updated = original.replace(findText, replaceText);
   await fs.writeFile(target, updated, "utf8");
   return `edited ${relativePath}`;
+}
+async function webSearch(query) {
+  if (process.env.WEB_SEARCH_ENABLED === "false") {
+    throw new Error("WEB_SEARCH_ENABLED=false のため web_search は無効です");
+  }
+
+  if (!process.env.TAVILY_API_KEY) {
+    throw new Error("TAVILY_API_KEY が未設定です");
+  }
+
+  const q = String(query || "").trim();
+  if (!q) {
+    throw new Error("query を指定してください");
+  }
+
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.TAVILY_API_KEY}`
+    },
+    body: JSON.stringify({
+      query: q,
+      topic: "general",
+      search_depth: "basic",
+      max_results: 5,
+      include_answer: true,
+      include_raw_content: false
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`web_search failed: ${res.status} ${text}`);
+  }
+
+  const data = await res.json();
+
+  return {
+    query: q,
+    answer: data.answer || "",
+    results: (data.results || []).map(item => ({
+      title: item.title,
+      url: item.url,
+      content: item.content
+    }))
+  };
 }
 
 async function createViteReactApp(app_name) {
@@ -633,6 +855,21 @@ const TOOLS = [
           relative_path: { type: "string" }
         },
         additionalProperties: false
+      }
+    }
+  },
+  {
+  type: "function",
+  function: {
+    name: "fetch_url",
+    description: "公開URLの本文を取得する。GitHubのblob URLも raw URL に変換して読める",
+    parameters: {
+      type: "object",
+      properties: {
+        url: { type: "string" }
+      },
+      required: ["url"],
+      additionalProperties: false
       }
     }
   },
@@ -759,6 +996,21 @@ const TOOLS = [
         additionalProperties: false
       }
     }
+  },
+  {
+  type: "function",
+  function: {
+    name: "web_search",
+    description: "最新情報や外部情報を調べるためにWeb検索を実行する",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" }
+      },
+      required: ["query"],
+      additionalProperties: false
+      }
+    }
   }
 ];
 
@@ -778,8 +1030,12 @@ async function handleTool(name, args, options = {}) {
       return await writeFile(args.relative_path, args.content);
     case "edit_file":
       return await editFile(args.relative_path, args.find_text, args.replace_text);
+    case "fetch_url":
+      return await fetchUrl(args.url);
     case "create_vite_react_app":
       return await createViteReactApp(args.app_name);
+    case "web_search":
+      return await webSearch(args.query);
     case "npm_install":
       return await npmInstall(args.project_dir);
     case "npm_build":
@@ -850,6 +1106,7 @@ async function planGoal(goal) {
         content:
           "あなたはDiscord上の開発エージェントです。" +
           "ユーザーの依頼を実行する前に、短い実行計画を作ってください。" +
+          "最新の仕様や公開情報が必要な場合は、内蔵の web search / web extractor を使って確認してください。" +
           "JSONだけ返してください。" +
           '{"summary":"...", "plan":["step1","step2","step3"], "notes":"..."}'
       },
@@ -886,6 +1143,7 @@ async function executeGoal(task) {
         "あなたはDiscord上の安全寄りな開発エージェントです。" +
         "workspace配下だけで作業してください。" +
         "必要に応じてツールを使い、アプリ作成・編集・ビルド確認を行ってください。" +
+        "最新仕様や外部情報が必要な場合は web_search を使って確認してください。" +
         "最後は日本語で簡潔に、何を作ったか・どこに作ったか・次に何をすべきか報告してください。"
     },
     {
@@ -951,23 +1209,105 @@ async function executeGoal(task) {
 }
 
 async function handleSimpleAI(prompt) {
-  const { response, route } = await callLLM("chat", {
-    messages: [
-      {
-        role: "system",
-        content:
-          "あなたはDiscord上の親切なアシスタントです。日本語で簡潔かつ実用的に答えてください。"
-      },
-      {
-        role: "user",
-        content: prompt
-      }
-    ],
-    temperature: 0.7
-  });
+  const messages = [
+    {
+      role: "system",
+      content:
+        "あなたはDiscord上の親切なアシスタントです。日本語で簡潔かつ実用的に答えてください。" +
+        "URLが含まれている場合、必要に応じて fetch_url を使って内容を確認してから答えてください。" +
+        "GitHub の blob URL が含まれる場合も、必要に応じて fetch_url を使って内容を確認してください。" +
+        "最新情報、ニュース、モデルの新情報、価格、API仕様、公開日、バージョンなど、" +
+        "変わりうる情報は必要に応じて web_search / web_extractor を使って確認してから答えてください。" +
+        "検索結果を使った場合でも、最後は必ずユーザー向けの自然な日本語の文章で答えてください。" +
+        "JSONだけを返したり、actionオブジェクトだけを返したりしないでください。"
+    },
+    {
+      role: "user",
+      content: prompt
+    }
+  ];
 
-  const text = getMessageText(response.choices?.[0]?.message);
-  return text || `返答を取得できませんでした。provider=${route.provider}, model=${route.model}`;
+  for (let i = 0; i < 6; i++) {
+    const { response, route } = await callLLM("chat", {
+      messages,
+      tools: TOOLS.filter(t => SAFE_TOOL_NAMES.has(t.function.name)),
+      temperature: 0.4,
+      max_tokens: 1400
+    });
+
+    console.log("handleSimpleAI raw response:", JSON.stringify(response, null, 2));
+
+    const message = response?.choices?.[0]?.message;
+    const toolCalls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+    let text = getMessageText(message);
+
+    if (!text) {
+      text =
+        response?.output_text ||
+        message?.output_text ||
+        message?.text ||
+        message?.refusal ||
+        "";
+    }
+
+    if (!toolCalls.length) {
+      const cleaned = String(text || "").trim();
+
+      if (cleaned) {
+        return cleaned;
+      }
+
+      return `返答を取得できませんでした。provider=${route.provider}, model=${route.model}`;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: text || message?.content || "",
+      tool_calls: toolCalls
+    });
+
+    for (const toolCall of toolCalls) {
+      const fn = toolCall.function || {};
+      const name = fn.name;
+      let args = {};
+
+      try {
+        args = JSON.parse(fn.arguments || "{}");
+      } catch (err) {
+        console.error("tool args parse error:", err);
+        args = {};
+      }
+
+      try {
+        const result = await handleTool(name, args, { approved: false });
+
+        console.log(
+          "handleSimpleAI tool result:",
+          JSON.stringify({ name, args, result }, null, 2)
+        );
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result, null, 2)
+        });
+      } catch (err) {
+        console.error("handleSimpleAI tool error:", err);
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(
+            { error: String(err?.message || err) },
+            null,
+            2
+          )
+        });
+      }
+    }
+  }
+
+  return "検索付き応答の上限に達しました。";
 }
 
 function formatTask(task) {
